@@ -41,6 +41,8 @@ type Registry interface {
 	// resource that constructed it.
 	RemoveClient(uid string)
 
+	IsClientKeyUpdated(privateKey *rsa.PrivateKey, uid string) bool
+
 	Getter
 }
 
@@ -180,4 +182,19 @@ func (r *registry) ListClients() map[string]acmecl.Interface {
 		out[k] = v.Interface
 	}
 	return out
+}
+
+func (r *registry) IsClientKeyUpdated(privateKey *rsa.PrivateKey, uid string) bool {
+
+	publicNBytes, _ := privateKey.PublicKey.N.GobEncode()
+	exponent := privateKey.PublicKey.E
+	stringFromBytes := string(publicNBytes)
+	if meta, ok := r.clients[uid]; ok {
+		if (meta.publicKey == stringFromBytes) &&
+			(meta.exponent == exponent) {
+			return false
+		}
+	}
+
+	return true
 }

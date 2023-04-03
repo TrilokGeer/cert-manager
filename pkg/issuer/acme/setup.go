@@ -198,6 +198,7 @@ func (a *Acme) Setup(ctx context.Context) error {
 	// we skip re-checking the account status to save excess calls to the
 	// ACME api.
 	if hasReadyCondition &&
+		a.accountRegistry.IsClientKeyUpdated(rsaPk, string(a.issuer.GetUID())) == false &&
 		a.issuer.GetStatus().ACMEStatus().URI != "" &&
 		parsedAccountURL.Host == parsedServerURL.Host &&
 		a.issuer.GetStatus().ACMEStatus().LastRegisteredEmail == a.issuer.GetSpec().ACME.Email {

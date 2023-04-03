@@ -145,3 +145,19 @@ func TestRegistry_AddClient_UpdatesExistingWhenPrivateKeyChanges(t *testing.T) {
 		t.Errorf("expected ListClients to have 1 item but it has %d", len(l))
 	}
 }
+
+func TestRegistry_IsClientKeyUpdated(t *testing.T) {
+	r := NewDefaultRegistry()
+	pkFirstClient, err := pki.GenerateRSAPrivateKey(2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Register a new client
+	r.AddClient(http.DefaultClient, "abc", cmacme.ACMEIssuer{}, pkFirstClient, "cert-manager-test")
+
+	pkSecClient, err := pki.GenerateRSAPrivateKey(2048)
+	if r.IsClientKeyUpdated(pkSecClient, "abc") == false {
+		t.Fatal("expected RSA key has multiple key associated")
+	}
+}
