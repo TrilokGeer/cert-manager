@@ -18,6 +18,7 @@ package experimental
 
 import (
 	"context"
+	"github.com/cert-manager/cert-manager/cmd/ctl/pkg/create/certificatebundle"
 
 	"github.com/spf13/cobra"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -38,6 +39,7 @@ func NewCmdExperimental(ctx context.Context, ioStreams genericclioptions.IOStrea
 
 	create := create.NewCmdCreateBare()
 	create.AddCommand(certificatesigningrequest.NewCmdCreateCSR(ctx, ioStreams))
+	create.AddCommand(certificatebundle.NewCmdCreateCB(ctx, ioStreams))
 	cmds.AddCommand(create)
 	cmds.AddCommand(install.NewCmdInstall(ctx, ioStreams))
 	cmds.AddCommand(uninstall.NewCmd(ctx, ioStreams))

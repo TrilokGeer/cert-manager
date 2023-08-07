@@ -14,34 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package certificaterequest
+package certificatebundle
 
 import (
 	"context"
-	"encoding/pem"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"time"
-
-	"github.com/spf13/cobra"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/cli-runtime/pkg/resource"
-	cmdutil "k8s.io/kubectl/pkg/cmd/util"
-	"k8s.io/kubectl/pkg/util/i18n"
-	"k8s.io/kubectl/pkg/util/templates"
+	"strings"
 
 	"github.com/cert-manager/cert-manager/cmd/ctl/pkg/build"
 	"github.com/cert-manager/cert-manager/cmd/ctl/pkg/factory"
-	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
-	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
-	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/cert-manager/cert-manager/pkg/ctl"
-	"github.com/cert-manager/cert-manager/pkg/util/pki"
+	"github.com/spf13/cobra"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
+	"k8s.io/kubectl/pkg/util/i18n"
+	"k8s.io/kubectl/pkg/util/templates"
 )
 
 var (
@@ -69,18 +60,37 @@ var (
 type Options struct {
 	// Name of file that the generated private key will be stored in
 	// If not specified, the private key will be written to <NameOfCR>.key
-	ConfigMapName string
-	// Name of file that the generated x509 certificate will be stored in if --fetch-certificate flag is set
-	// If not specified, the private key will be written to <NameOfCR>.crt
-	SecretName string
+	// Required
+	OldCACert string
+
+	// Name of file that the generated private key will be stored in
+	// If not specified, the private key will be written to <NameOfCR>.key
+	// Required
+	NewCACert string
+	/*
+		// configmap key selector
+		CMKeySelector string
+		// Name of file that the generated x509 certificate will be stored in if --fetch-certificate flag is set
+		// If not specified, the private key will be written to <NameOfCR>.crt
+		SecretName string
+
+		// Secret key selector
+		SecretKeySelector string
+	*/
 	// Path to a file containing a Certificate resource used as a template
 	// when generating the certificatebundle resource
 	// Required
-	Namespace string
+	// Namespace string
+
 	// Output file name for saving bundle to a local file
-	OutputFilename string
+	Name string
+
+	// Output as trust bundle
+	// or as config map
+	OutputAs string
 
 	genericclioptions.IOStreams
+
 	*factory.Factory
 }
 
@@ -91,8 +101,8 @@ func NewOptions(ioStreams genericclioptions.IOStreams) *Options {
 	}
 }
 
-// NewCmdCreateCR returns a cobra command for create certificatebundle
-func NewCmdCreateCR(ctx context.Context, ioStreams genericclioptions.IOStreams) *cobra.Command {
+// NewCmdCreateCB returns a cobra command for create certificatebundle
+func NewCmdCreateCB(ctx context.Context, ioStreams genericclioptions.IOStreams) *cobra.Command {
 	o := NewOptions(ioStreams)
 
 	cmd := &cobra.Command{
@@ -107,13 +117,16 @@ func NewCmdCreateCR(ctx context.Context, ioStreams genericclioptions.IOStreams) 
 			cmdutil.CheckErr(o.Run(ctx, args))
 		},
 	}
-	cmd.Flags().StringVar(&o.ConfigMapName, "from-configmap", o.ConfigMapName,
+	cmd.Flags().StringVar(&o.OldCACert, "old-ca-cert", o.OldCACert,
 		"Path to a file containing a Certificate resource used as a template when generating the certificatebundle resource")
-	cmd.Flags().StringVar(&o.SecretName, "from-secret", o.SecretName,
+	cmd.Flags().StringVar(&o.NewCACert, "new-ca-cert", o.NewCACert,
 		"Name of file that the generated private key will be written to")
-	cmd.Flags().StringVar(&o.Namespace, "namespace", o.Namespace,
+	/*
+		cmd.Flags().StringVar(&o.Namespace, "namespace", o.Namespace,
+			"Name of the file the certificate is to be stored in")*/
+	cmd.Flags().StringVar(&o.Name, "name", o.Name,
 		"Name of the file the certificate is to be stored in")
-	cmd.Flags().StringVar(&o.OutputFilename, "output-file", o.OutputFilename,
+	cmd.Flags().StringVar(&o.OutputAs, "output-as", o.OutputAs,
 		"Name of the file the certificate is to be stored in")
 	o.Factory = factory.New(ctx, cmd)
 
@@ -122,202 +135,128 @@ func NewCmdCreateCR(ctx context.Context, ioStreams genericclioptions.IOStreams) 
 
 // Validate validates the provided options
 func (o *Options) Validate(args []string) error {
-	if len(args) < 1 {
-		return errors.New("the name of the certificatebundle to be created has to be provided as argument")
-	}
-	if len(args) > 1 {
-		return errors.New("only one argument can be passed in: the name of the certificatebundle")
-	}
+	// TBD
 
-	if o.ConfigMapName == "" && o.SecretName == "" {
-		return errors.New("the path to a YAML manifest of a Certificate resource cannot be empty, please specify by using --from-certificate-file flag")
+	if o.Name == "" {
+		return errors.New("name field is required to create output by specified name")
 	}
 
 	return nil
+}
+
+func (o *Options) BundleToConfigmap(oldcasecret, newcasecret *v1.Secret) (*v1.ConfigMap, error) {
+
+	var cadata string
+	var bundle []string
+	var packedBundle string
+
+	cadata = string(oldcasecret.Data["tls.crt"])
+	sanitizedcadata, err := ValidateAndSanitizePEMBundle([]byte(cadata))
+	if err != nil {
+		fmt.Errorf("Failed to validate and sanitize pem data for old ca")
+		return nil, nil
+	}
+	bundle = append(bundle, string(sanitizedcadata))
+
+	cadata = string(newcasecret.Data["tls.crt"])
+	sanitizedcadata, err = ValidateAndSanitizePEMBundle([]byte(cadata))
+	if err != nil {
+		fmt.Errorf("Failed to validate and sanitize pem data for new ca")
+		return nil, nil
+	}
+	bundle = append(bundle, string(sanitizedcadata))
+	packedBundle = strings.Join(bundle, "\n") + "\n"
+	var datamap = make(map[string]string, 1)
+	datamap["bundle.crt"] = packedBundle
+	cm := v1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      o.Name,
+			Namespace: o.Namespace,
+		},
+		Immutable:  nil,
+		Data:       datamap,
+		BinaryData: nil,
+	}
+	return &cm, nil
 }
 
 // Run executes create certificatebundle command
 func (o *Options) Run(ctx context.Context, args []string) error {
-	builder := new(resource.Builder)
 
-	// Read file as internal API version
-	r := builder.
-		WithScheme(scheme, schema.GroupVersion{Group: cmapi.SchemeGroupVersion.Group, Version: runtime.APIVersionInternal}).
-		LocalParam(true).ContinueOnError().
-		NamespaceParam(o.Namespace).DefaultNamespace().
-		FilenameParam(o.EnforceNamespace, &resource.FilenameOptions{Filenames: []string{o.InputFilename}}).Flatten().Do()
-
-	if err := r.Err(); err != nil {
+	oldcacertificate, err := o.CMClient.CertmanagerV1().Certificates(o.Namespace).Get(ctx, o.OldCACert, metav1.GetOptions{})
+	if err != nil {
+		fmt.Errorf("Failed to retrieve certificate object [%s] with error [%v]", o.OldCACert, err.Error())
+		return err
+	}
+	if oldcacertificate.Spec.IsCA == false {
+		fmt.Errorf("Retrieved certificate object [%s] is not CA certificate", o.OldCACert)
+		return err
+	}
+	if oldcacertificate.Status.Conditions[0].Type != "Ready" {
+		fmt.Errorf("Retrieved certificate object [%s] is not ready", o.OldCACert)
+		return err
+	}
+	if oldcacertificate.Status.Conditions[0].Status != "True" {
+		fmt.Errorf("Retrieved certificate object [%s] ready status is false", o.OldCACert)
 		return err
 	}
 
-	singleItemImplied := false
-	infos, err := r.IntoSingleItemImplied(&singleItemImplied).Infos()
+	newcacertificate, err := o.CMClient.CertmanagerV1().Certificates(o.Namespace).Get(ctx, o.NewCACert, metav1.GetOptions{})
 	if err != nil {
+		fmt.Errorf("Failed to retrieve certificate object [%s] with error [%v]", o.NewCACert, err.Error())
 		return err
 	}
-
-	// Ensure only one object per command
-	if len(infos) == 0 {
-		return fmt.Errorf("no objects found in manifest file %q. Expected one Certificate object", o.InputFilename)
+	if newcacertificate.Spec.IsCA == false {
+		fmt.Errorf("Retrieved certificate object [%s] is not CA certificate", o.NewCACert)
+		return err
 	}
-	if len(infos) > 1 {
-		return fmt.Errorf("multiple objects found in manifest file %q. Expected only one Certificate object", o.InputFilename)
+	if newcacertificate.Status.Conditions[0].Type != "Ready" {
+		fmt.Errorf("Retrieved certificate object [%s] is not ready", o.OldCACert)
+		return err
 	}
-	info := infos[0]
-	// Convert to v1 because that version is needed for functions that follow
-	crtObj, err := scheme.ConvertToVersion(info.Object, cmapi.SchemeGroupVersion)
+	if newcacertificate.Status.Conditions[0].Status != "True" {
+		fmt.Errorf("Retrieved certificate object [%s] ready status is false", o.OldCACert)
+		return err
+	}
+	// retrieve secrets from old ca certificate
+	oldcasecret, err := o.KubeClient.CoreV1().Secrets(o.Namespace).Get(ctx, oldcacertificate.Spec.SecretName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to convert object into version v1: %w", err)
+		fmt.Errorf("Failed to retrieve secret [%s] with error [%v]", oldcacertificate.Spec.SecretName, err)
+		return err
 	}
+	fmt.Printf("Retrieved old ca secret ======")
+	jsondata, _ := json.Marshal(oldcasecret)
+	fmt.Print("[%v]", jsondata)
+	fmt.Printf("Retrieved old ca secret ends======")
 
-	// Cast Object into Certificate
-	crt, ok := crtObj.(*cmapi.Certificate)
-	if !ok {
-		return errors.New("decoded object is not a v1 Certificate")
-	}
-
-	crt = crt.DeepCopy()
-	if crt.Spec.PrivateKey == nil {
-		crt.Spec.PrivateKey = &cmapi.CertificatePrivateKey{}
-	}
-
-	signer, err := pki.GeneratePrivateKeyForCertificate(crt)
+	newcasecret, err := o.KubeClient.CoreV1().Secrets(o.Namespace).Get(ctx, newcacertificate.Spec.SecretName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("error when generating new private key for certificatebundle: %w", err)
+		fmt.Errorf("Failed to retrieve secret [%s] with error [%v]", newcacertificate.Spec.SecretName, err)
+		return err
 	}
+	fmt.Printf("Retrieved new ca secret ======")
+	jsondata, _ = json.Marshal(newcasecret)
+	fmt.Print("[%v]", jsondata)
+	fmt.Printf("Retrieved new ca secret ends======")
 
-	keyData, err := pki.EncodePrivateKey(signer, crt.Spec.PrivateKey.Encoding)
-	if err != nil {
-		return fmt.Errorf("failed to encode new private key for certificatebundle: %w", err)
-	}
-
-	crName := args[0]
-
-	// Storing private key to file
-	keyFileName := crName + ".key"
-	if o.KeyFilename != "" {
-		keyFileName = o.KeyFilename
-	}
-	if err := os.WriteFile(keyFileName, keyData, 0600); err != nil {
-		return fmt.Errorf("error when writing private key to file: %w", err)
-	}
-	fmt.Fprintf(o.ErrOut, "Private key written to file %s\n", keyFileName)
-
-	// Build certificatebundle with name as specified by argument
-	req, err := buildcertificatebundle(crt, keyData, crName)
-	if err != nil {
-		return fmt.Errorf("error when building certificatebundle: %w", err)
-	}
-
-	ns := crt.Namespace
-	if ns == "" {
-		ns = o.Namespace
-	}
-	req, err = o.CMClient.CertmanagerV1().certificatebundles(ns).Create(ctx, req, metav1.CreateOptions{})
-	if err != nil {
-		return fmt.Errorf("error creating certificatebundle: %w", err)
-	}
-	fmt.Fprintf(o.ErrOut, "certificatebundle %s has been created in namespace %s\n", req.Name, req.Namespace)
-
-	if o.FetchCert {
-		fmt.Fprintf(o.ErrOut, "certificatebundle %v in namespace %v has not been signed yet. Wait until it is signed...\n",
-			req.Name, req.Namespace)
-		err = wait.PollUntilContextTimeout(ctx, time.Second, o.Timeout, false, func(ctx context.Context) (done bool, err error) {
-			req, err = o.CMClient.CertmanagerV1().certificatebundles(req.Namespace).Get(ctx, req.Name, metav1.GetOptions{})
-			if err != nil {
-				return false, nil
-			}
-			return apiutil.certificatebundleHasCondition(req, cmapi.certificatebundleCondition{
-				Type:   cmapi.certificatebundleConditionReady,
-				Status: cmmeta.ConditionTrue,
-			}) && len(req.Status.Certificate) > 0, nil
-		})
+	switch o.OutputAs {
+	case "configmap":
+		configmap, err := o.BundleToConfigmap(oldcasecret, newcasecret)
 		if err != nil {
-			return fmt.Errorf("error when waiting for certificatebundle to be signed: %w", err)
+			fmt.Errorf("Failed to build configmap with error [%v]", err)
+			return err
 		}
-		fmt.Fprintf(o.ErrOut, "certificatebundle %v in namespace %v has been signed\n", req.Name, req.Namespace)
-
-		// Fetch x509 certificate and store to file
-		actualCertFileName := req.Name + ".crt"
-		if o.CertFileName != "" {
-			actualCertFileName = o.CertFileName
-		}
-		err = fetchCertificateFromCR(req, actualCertFileName)
+		_, err = o.KubeClient.CoreV1().ConfigMaps(o.Namespace).Create(ctx, configmap, metav1.CreateOptions{})
 		if err != nil {
-			return fmt.Errorf("error when writing certificate to file: %w", err)
+			fmt.Errorf("Create config map failed with error [%v]", err)
+			return err
 		}
-		fmt.Fprintf(o.ErrOut, "Certificate written to file %s\n", actualCertFileName)
+	case "trustbundle":
+		//TBD
 	}
-
-	return nil
-}
-
-// Builds a certificatebundle
-func buildcertificatebundle(crt *cmapi.Certificate, pk []byte, crName string) (*cmapi.certificatebundle, error) {
-	csrPEM, err := generateCSR(crt, pk)
-	if err != nil {
-		return nil, err
-	}
-
-	cr := &cmapi.certificatebundle{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        crName,
-			Annotations: crt.Annotations,
-			Labels:      crt.Labels,
-		},
-		Spec: cmapi.certificatebundleSpec{
-			Request:   csrPEM,
-			Duration:  crt.Spec.Duration,
-			IssuerRef: crt.Spec.IssuerRef,
-			IsCA:      crt.Spec.IsCA,
-			Usages:    crt.Spec.Usages,
-		},
-	}
-
-	return cr, nil
-}
-
-func generateCSR(crt *cmapi.Certificate, pk []byte) ([]byte, error) {
-	csr, err := pki.GenerateCSR(crt)
-	if err != nil {
-		return nil, err
-	}
-
-	signer, err := pki.DecodePrivateKeyBytes(pk)
-	if err != nil {
-		return nil, err
-	}
-
-	csrDER, err := pki.EncodeCSR(csr, signer)
-	if err != nil {
-		return nil, err
-	}
-
-	csrPEM := pem.EncodeToMemory(&pem.Block{
-		Type: "CERTIFICATE REQUEST", Bytes: csrDER,
-	})
-
-	return csrPEM, nil
-}
-
-// fetchCertificateFromCR fetches the x509 certificate from a CR and stores the
-// certificate in file specified by certFilename. Assumes CR is ready,
-// otherwise returns error.
-func fetchCertificateFromCR(req *cmapi.certificatebundle, certFileName string) error {
-	// If CR not ready yet, error
-	if !apiutil.certificatebundleHasCondition(req, cmapi.certificatebundleCondition{
-		Type:   cmapi.certificatebundleConditionReady,
-		Status: cmmeta.ConditionTrue,
-	}) || len(req.Status.Certificate) == 0 {
-		return errors.New("certificatebundle is not ready yet, unable to fetch certificate")
-	}
-
-	// Store certificate to file
-	err := os.WriteFile(certFileName, req.Status.Certificate, 0600)
-	if err != nil {
-		return fmt.Errorf("error when writing certificate to file: %w", err)
-	}
-
 	return nil
 }
